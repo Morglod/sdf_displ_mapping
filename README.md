@@ -1,8 +1,10 @@
-# sdf_displ_mapping
+sdf with displacement mapping
 
-sdf with displacement mapping demo
+webgl demo: https://morglod.github.io/sdf_displ_mapping/
 
-link https://morglod.github.io/sdf_displ_mapping/
+---
+
+<iframe width="560" height="315" src="https://www.youtube.com/embed/ZKxgWxeZGOY" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture" allowfullscreen></iframe>
 
 # credits
 
