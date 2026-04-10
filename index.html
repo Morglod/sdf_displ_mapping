@@ -33,6 +33,8 @@ function dbg(m){L.push(m);D.textContent=L.join('\n');}
 const canvas=document.getElementById('c');
 const gl=canvas.getContext('webgl2');
 if(!gl){dbg('No WebGL2');throw 0;}
+gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
 
 function resize(){
   const d=Math.min(devicePixelRatio,1.5);
@@ -92,6 +94,26 @@ uniform float uSpeed;
 uniform float uWaterY;
 
 out vec4 fc;
+
+vec3 envMap(vec3 dir) {
+  // Sky gradient
+  float y = dir.y * 0.5 + 0.5;
+  vec3 sky = mix(vec3(0.6, 0.5, 0.4), vec3(0.2, 0.35, 0.65), y);
+  
+  // Sun disk
+  vec3 sunDir = normalize(vec3(0.5, 0.3, 0.8));
+  float sun = pow(max(dot(dir, sunDir), 0.0), 256.0) * 3.0;
+  sky += vec3(1.0, 0.9, 0.7) * sun;
+  
+  // Sun glow
+  float glow = pow(max(dot(dir, sunDir), 0.0), 8.0);
+  sky += vec3(0.4, 0.3, 0.15) * glow;
+  
+  // Ground blend
+  sky = mix(vec3(0.15, 0.12, 0.1), sky, smoothstep(-0.1, 0.1, dir.y));
+  
+  return sky;
+}
 
 float sdBox(vec3 p, vec3 b){
   vec3 q=abs(p)-b;
@@ -228,13 +250,52 @@ float march(vec3 ro, vec3 rd){
   return -1.0;
 }
 
+// AgX tonemapping
+vec3 agxDefaultContrastApprox(vec3 x) {
+  vec3 x2 = x * x;
+  vec3 x4 = x2 * x2;
+  return + 15.5     * x4 * x2
+         - 40.14    * x4 * x
+         + 31.96    * x4
+         - 6.868    * x2 * x
+         + 0.4298   * x2
+         + 0.1191   * x
+         - 0.00232;
+}
+
+vec3 agx(vec3 val) {
+  const mat3 agx_mat = mat3(
+    0.842479062253094,  0.0423282422610123, 0.0423756549057051,
+    0.0784335999999992, 0.878468636469772,  0.0784336,
+    0.0792237451477643, 0.0791661274605434, 0.879142973793104
+  );
+  const float min_ev = -12.47393;
+  const float max_ev = 4.026069;
+  
+  val = agx_mat * val;
+  val = clamp(log2(val), min_ev, max_ev);
+  val = (val - min_ev) / (max_ev - min_ev);
+  val = agxDefaultContrastApprox(val);
+  return val;
+}
+
+vec3 agxEotf(vec3 val) {
+  const mat3 agx_mat_inv = mat3(
+    1.19687900512017,   -0.0528968517574562, -0.0529716355144438,
+    -0.0980208811401368, 1.15190312990417,   -0.0980434501171241,
+    -0.0990297440797205,-0.0989611768448433,  1.15107367264116
+  );
+  val = agx_mat_inv * val;
+  return pow(max(val, vec3(0.0)), vec3(2.2));
+}
+
 void main(){
   vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
   vec3 rd = normalize(uCamRot * vec3(uv, 1.0));
 
   float t = march(uCamPos, rd);
   if(t < 0.0){
-    fc = vec4(vec3(0.04), 1.0);
+    fc = vec4(pow(envMap(rd), vec3(1.0/2.2)), 1.0);
     return;
   }
 
@@ -319,7 +380,8 @@ void main(){
   float ao = sdfAO(hp, dn) * texAO;
 
   // Combine
-  vec3 col = alb * 0.12 * ao  // ambient
+  vec3 ambient = envMap(wn) * 0.15 * alb * ao;
+  vec3 col = ambient // ambient
            + alb * ndl * shadow * lightCol // diffuse
            + vec3(spec) * shadow * lightCol; // specular
 
@@ -330,7 +392,8 @@ void main(){
   fresnel = mix(0.04, 1.0, fresnel) * wetness * shadow;
 
   float sunSpec = pow(max(dot(refl, lightDir), 0.0), 512.0) * 3.0 * wetness  * shadow;
-  vec3 skyRefl = mix(vec3(0.1, 0.12, 0.15), vec3(0.3, 0.4, 0.5), max(refl.y, 0.0));
+  // vec3 skyRefl = mix(vec3(0.1, 0.12, 0.15), vec3(0.3, 0.4, 0.5), max(refl.y, 0.0));
+    vec3 skyRefl = envMap(refl);
 
   // Blend reflection on top of final color
   col = mix(col, skyRefl, fresnel) + vec3(sunSpec) * lightCol;
@@ -340,6 +403,10 @@ void main(){
     // After tonemap + gamma
   col = col / (col + 1.0);
   col = pow(col, vec3(1.0 / 2.2));
+
+  // col = pow(col, vec3(1.0 / 1.9));
+  // col = agx(col);
+  // col = agxEotf(col);
 
   // Saturation boost
   float lum = dot(col, vec3(0.299, 0.587, 0.114));

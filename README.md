@@ -6,4 +6,4 @@ video: https://www.youtube.com/watch?v=ZKxgWxeZGOY
 
 # credits
 
-texture pack: https://polyhaven.com/a/gray_rocks
+rock texture: https://polyhaven.com/a/gray_rocks
