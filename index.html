@@ -21,7 +21,8 @@ canvas{display:block;width:100vw;height:100vh}
   <label>Tiling <input type="range" id="sTile" min="0.5" max="6" step="0.25" value="0.5"><span class="v" id="vTile">0.5</span></label>
   <label>Height <input type="range" id="sHScale" min="0.01" max="0.2" step="0.005" value="0.07"><span class="v" id="vHScale">0.07</span></label>
   <label>Height mult <input type="range" id="sHScaleMult" min="0.1" max="2.0" step="0.005" value="1.29"><span class="v" id="vHScaleMult">1.29</span></label>
-  <label>Anim Speed <input type="range" id="sSpeed" min="0" max="3" step="0.1" value="0.5"><span class="v" id="vSpeed">0.50</span></label>
+  <label>Anim Speed <input type="range" id="sSpeed" min="0" max="3" step="0.1" value="0.5"><span class="v" id="vSpeed">0.5</span></label>
+  <label>Water level <input type="range" id="sWaterY" min="0" max="1" step="0.001" value="0.35"><span class="v" id="vWaterY">0.35</span></label>
 </div>
 <div id="dbg"></div>
 <canvas id="c"></canvas>
@@ -88,6 +89,7 @@ uniform float uHScale;
 uniform float uHScaleMult;
 uniform float uTime;
 uniform float uSpeed;
+uniform float uWaterY;
 
 out vec4 fc;
 
@@ -112,7 +114,7 @@ float smin(float a, float b, float k){
 float scene(vec3 p){
   // Repeat every 6 units on X and Z
   p.xz = mod(p.xz + 3.0, 6.0) - 3.0;
-  
+
   float floor = p.y + 1.5;
   float pillarL = sdBox(p - vec3(-1.2, 0.0, 0.0), vec3(0.3, 1.5, 0.4));
   float pillarR = sdBox(p - vec3( 1.2, 0.0, 0.0), vec3(0.3, 1.5, 0.4));
@@ -279,6 +281,27 @@ void main(){
   float rXY = texture(uRoughness, hp.xy * uTile).r;
   float roughness = rXZ * aw.y + rZY * aw.x + rXY * aw.z;
 
+  // water1
+  // Sample height at hit point (reuse triplanar blend)
+  float hXZ = textureLod(uHeight, hp.xz * uTile, 0.0).r;
+  float hZY = textureLod(uHeight, hp.zy * uTile, 0.0).r;
+  float hXY = textureLod(uHeight, hp.xy * uTile, 0.0).r;
+  float h = hXZ * aw.y + hZY * aw.x + hXY * aw.z;
+
+  // Water in low areas
+  float waterLine = uWaterY; // 0.0 - 1.0, how high the water sits
+  float wetness = smoothstep(waterLine, waterLine - 0.05, h);
+
+  // Darken albedo when wet
+  alb = mix(alb, alb * 0.3 * vec3(0.7, 0.8, 0.9), wetness);
+
+  // Override roughness — water is glossy
+  roughness = mix(roughness, 0.02, wetness);
+
+  // Flatten normal toward geometry normal in wet areas
+  wn = normalize(mix(wn, dn, wetness * 0.8));
+  // ----- end water 1
+
   // Lighting
   vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
   vec3 lightCol = vec3(0.9, 0.9, 1.0); // warm
@@ -300,6 +323,18 @@ void main(){
            + alb * ndl * shadow * lightCol // diffuse
            + vec3(spec) * shadow * lightCol; // specular
 
+  { // water2
+     vec3 viewDir = normalize(uCamPos - hp);
+  vec3 refl = reflect(-viewDir, wn);
+  float fresnel = pow(1.0 - max(dot(viewDir, wn), 0.0), 5.0);
+  fresnel = mix(0.04, 1.0, fresnel) * wetness * shadow;
+
+  float sunSpec = pow(max(dot(refl, lightDir), 0.0), 512.0) * 3.0 * wetness  * shadow;
+  vec3 skyRefl = mix(vec3(0.1, 0.12, 0.15), vec3(0.3, 0.4, 0.5), max(refl.y, 0.0));
+
+  // Blend reflection on top of final color
+  col = mix(col, skyRefl, fresnel) + vec3(sunSpec) * lightCol;
+  }
   // col *= ao;
 
     // After tonemap + gamma
@@ -329,7 +364,7 @@ else dbg('Linked OK');
 gl.useProgram(prog);
 
 const loc={};
-['uRes','uCamPos','uCamRot','uAlbedo','uHeight','uNormal','uTile','uHScale', 'uHScaleMult', 'uTime','uSpeed'].forEach(n=>{
+['uRes','uCamPos','uCamRot','uAlbedo','uHeight','uNormal','uTile','uHScale', 'uHScaleMult', 'uTime','uSpeed', 'uWaterY'].forEach(n=>{
   loc[n]=gl.getUniformLocation(prog,n);
   if(loc[n]===null) dbg('WARN null: '+n);
 });
@@ -367,6 +402,9 @@ sHScaleMult.oninput=()=>vHScaleMult.textContent=parseFloat(sHScaleMult.value).to
 const sSpeed=document.getElementById('sSpeed'),vSpeed=document.getElementById('vSpeed');
 sSpeed.oninput=()=>vSpeed.textContent=parseFloat(sSpeed.value).toFixed(2);
 
+const sWaterY=document.getElementById('sWaterY'),vWaterY=document.getElementById('vWaterY');
+sWaterY.oninput=()=>vWaterY.textContent=parseFloat(sWaterY.value).toFixed(2);
+
 Promise.all([
   loadTex('./textures/gray_rocks_diff_2k.jpg'),
   loadTex('./textures/gray_rocks_disp_2k.png'),
@@ -401,6 +439,7 @@ Promise.all([
     gl.uniform1f(loc.uHScaleMult,parseFloat(sHScaleMult.value));
     gl.uniform1f(loc.uTime, t);
     gl.uniform1f(loc.uSpeed, parseFloat(sSpeed.value));
+    gl.uniform1f(loc.uWaterY, parseFloat(sWaterY.value));
 
     gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tAlb);
     gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,tHgt);
