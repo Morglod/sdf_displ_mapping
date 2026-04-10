@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SDF Plane + Texture</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;overflow:hidden;font-family:'Courier New',monospace;color:#ccc}
+canvas{display:block;width:100vw;height:100vh}
+#ui{position:fixed;top:20px;left:20px;z-index:10;background:rgba(0,0,0,.78);padding:16px 20px;border-radius:8px;border:1px solid rgba(255,255,255,.1);font-size:13px;min-width:200px;user-select:none}
+#ui h1{font-size:13px;letter-spacing:2px;color:#f0c040;margin-bottom:10px;text-transform:uppercase}
+#ui label{display:flex;justify-content:space-between;align-items:center;margin:5px 0}
+#ui input[type=range]{width:100px;accent-color:#f0c040}
+#ui span.v{width:38px;text-align:right;font-size:11px;color:#999}
+#dbg{position:fixed;bottom:0;left:0;right:0;z-index:200;background:rgba(0,0,0,.9);color:#0f0;font-size:11px;padding:8px;max-height:25vh;overflow-y:auto;white-space:pre-wrap;font-family:monospace}
+</style>
+</head>
+<body>
+<div id="ui">
+  <h1>SDF Plane</h1>
+  <label>Tiling <input type="range" id="sTile" min="0.5" max="6" step="0.25" value="0.5"><span class="v" id="vTile">0.5</span></label>
+  <label>Height <input type="range" id="sHScale" min="0.01" max="0.2" step="0.005" value="0.07"><span class="v" id="vHScale">0.07</span></label>
+  <label>Height mult <input type="range" id="sHScaleMult" min="0.1" max="2.0" step="0.005" value="1.29"><span class="v" id="vHScaleMult">1.29</span></label>
+  <label>Anim Speed <input type="range" id="sSpeed" min="0" max="3" step="0.1" value="0.5"><span class="v" id="vSpeed">0.50</span></label>
+</div>
+<div id="dbg"></div>
+<canvas id="c"></canvas>
+<script>
+const D=document.getElementById('dbg'),L=[];
+function dbg(m){L.push(m);D.textContent=L.join('\n');}
+
+const canvas=document.getElementById('c');
+const gl=canvas.getContext('webgl2');
+if(!gl){dbg('No WebGL2');throw 0;}
+
+function resize(){
+  const d=Math.min(devicePixelRatio,1.5);
+  canvas.width=innerWidth*d;canvas.height=innerHeight*d;
+  gl.viewport(0,0,canvas.width,canvas.height);
+}
+addEventListener('resize',resize);resize();
+
+function loadTex(url){
+  return new Promise(res=>{
+    const img=new Image();img.crossOrigin='anonymous';
+    img.onload=()=>{
+      const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,img);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+      dbg('TEX OK: '+img.width+'x'+img.height);
+      res(t);
+    };
+    img.onerror=()=>{
+      dbg('TEX FAIL: ' + url);
+      const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+      gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,2,2,0,gl.RGBA,gl.UNSIGNED_BYTE,
+        new Uint8Array([180,160,140,255,170,150,130,255,175,155,135,255,165,145,125,255]));
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+      res(t);
+    };
+    img.src=url;
+  });
+}
+
+const VS=`#version 300 es
+layout(location=0) in vec2 aPos;
+void main(){ gl_Position=vec4(aPos,0,1); }`;
+
+const FS=`#version 300 es
+precision highp float;
+uniform vec2 uRes;
+uniform vec3 uCamPos;
+uniform mat3 uCamRot;
+uniform sampler2D uAlbedo;
+uniform sampler2D uHeight;
+uniform sampler2D uNormal;
+uniform sampler2D uAO;
+uniform sampler2D uRoughness;
+uniform float uTile;
+uniform float uHScale;
+uniform float uHScaleMult;
+uniform float uTime;
+uniform float uSpeed;
+
+out vec4 fc;
+
+float sdBox(vec3 p, vec3 b){
+  vec3 q=abs(p)-b;
+  return length(max(q,0.0))+min(max(q.x,max(q.y,q.z)),0.0);
+}
+
+float sdCylinder(vec3 p, float r, float h){
+  vec2 d=vec2(length(p.xz)-r, abs(p.y)-h);
+  return min(max(d.x,d.y),0.0)+length(max(d,0.0));
+}
+
+float opSub(float a, float b){ return max(a,-b); }
+
+float smin(float a, float b, float k){
+  float h=clamp(0.5+0.5*(b-a)/k, 0.0, 1.0);
+  return mix(b,a,h)-k*h*(1.0-h);
+}
+
+// Base SDF without displacement
+float scene(vec3 p){
+  float floor = p.y + 1.5;
+  float pillarL = sdBox(p - vec3(-1.2, 0.0, 0.0), vec3(0.3, 1.5, 0.4));
+  float pillarR = sdBox(p - vec3( 1.2, 0.0, 0.0), vec3(0.3, 1.5, 0.4));
+  float beam = sdBox(p - vec3(0.0, 1.8, 0.0), vec3(1.8, 0.3, 0.5));
+  float archOuter = sdCylinder(p - vec3(0.0, 1.0, 0.0), 1.2, 0.5);
+  float archInner = sdCylinder(p - vec3(0.0, 1.0, 0.0), 0.85, 0.6);
+  float archCut = -(p.y - 1.0);
+  float arch = max(opSub(archOuter, archInner), archCut);
+  float capL = sdBox(p - vec3(-1.2, 1.55, 0.0), vec3(0.38, 0.08, 0.48));
+  float capR = sdBox(p - vec3( 1.2, 1.55, 0.0), vec3(0.38, 0.08, 0.48));
+  float wall = sdBox(p - vec3(0.0, 0.2, -0.3), vec3(2.5, 2.0, 0.15));
+  float opening = sdBox(p - vec3(0.0, 0.0, -0.3), vec3(0.8, 1.2, 0.3));
+  wall = opSub(wall, opening);
+
+  float k = 0.08;
+  float d = min(floor, smin(pillarL, pillarR, k));
+  d = smin(d, beam, k);
+  d = smin(d, arch, k);
+  d = smin(d, smin(capL, capR, k), k);
+  d = smin(d, wall, k);
+
+   // Animated subtracting sphere
+  vec3 spherePos = vec3(sin(uTime * uSpeed) * 1.5, 0.3 + sin(uTime * uSpeed * 0.7) * 0.5, cos(uTime * uSpeed) * 1.0);
+  float sphere = length(p - spherePos) - 1.5;
+  d = max(d, -sphere); // subtraction
+
+  return d;
+}
+
+// SDF soft shadow along light direction
+float sdfShadow(vec3 ro, vec3 rd){
+  float t=0.05, res=1.0;
+  for(int i=0; i<32; i++){
+    float d=scene(ro+rd*t);
+    res=min(res, 6.0*d/t);
+    t+=clamp(d, 0.02, 0.3);
+    if(d<0.001 || t>5.0) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+// SDF ambient occlusion
+float sdfAO(vec3 p, vec3 n){
+  float a=0.0, s=1.0;
+  for(int i=1; i<6; i++){
+    float h=0.04*float(i);
+    a+=(h-scene(p+n*h))*s;
+    s*=0.5;
+  }
+  return clamp(1.0-a*3.0, 0.0, 1.0);
+}
+
+// Triplanar UV from position using base SDF gradient
+vec2 triplanarUV(vec3 p, vec3 n){
+  vec3 aN = abs(n);
+  if(aN.y >= aN.x && aN.y >= aN.z) return p.xz * uTile;
+  else if(aN.x >= aN.z) return p.zy * uTile;
+  else return p.xy * uTile;
+}
+
+// SDF displaced by heightfield — the core of the technique
+float sceneDisplaced(vec3 p){
+  float d = scene(p);
+
+  // Only sample height near the surface (optimization)
+  if(d > uHScale * 2.0) return d - uHScale * 0.5;
+
+  // Compute base SDF gradient for triplanar axis selection
+  vec2 e = vec2(0.02, 0.0);
+  vec3 n = vec3(
+    scene(p+e.xyy) - scene(p-e.xyy),
+    scene(p+e.yxy) - scene(p-e.yxy),
+    scene(p+e.yyx) - scene(p-e.yyx)
+  );
+
+  vec2 huv = triplanarUV(p, n);
+  float h = textureLod(uHeight, huv, 0.0).r * uHScaleMult;
+
+  // Displace: surface moves inward by height
+  return d - h * uHScale;
+}
+
+// Normal of displaced surface
+vec3 calcN(vec3 p){
+  vec2 e = vec2(0.001, 0.0);
+  return normalize(vec3(
+    sceneDisplaced(p+e.xyy) - sceneDisplaced(p-e.xyy),
+    sceneDisplaced(p+e.yxy) - sceneDisplaced(p-e.yxy),
+    sceneDisplaced(p+e.yyx) - sceneDisplaced(p-e.yyx)
+  ));
+}
+
+// Normal of base (undisplaced) scene for triplanar blending
+vec3 calcBaseN(vec3 p){
+  vec2 e = vec2(0.001, 0.0);
+  return normalize(vec3(
+    scene(p+e.xyy) - scene(p-e.xyy),
+    scene(p+e.yxy) - scene(p-e.yxy),
+    scene(p+e.yyx) - scene(p-e.yyx)
+  ));
+}
+
+float march(vec3 ro, vec3 rd){
+  float t = 0.0;
+  for(int i = 0; i < 256; i++){
+    float d = sceneDisplaced(ro + rd * t);
+    if(d < 0.001) return t;
+    if(t > 20.0) return -1.0;
+    t += d * 0.8; // slight relaxation for displaced SDF
+  }
+  return -1.0;
+}
+
+void main(){
+  vec2 uv = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
+  vec3 rd = normalize(uCamRot * vec3(uv, 1.0));
+
+  float t = march(uCamPos, rd);
+  if(t < 0.0){
+    fc = vec4(vec3(0.04), 1.0);
+    return;
+  }
+
+  vec3 hp = uCamPos + rd * t;
+
+  // Displaced normal for lighting
+  vec3 dn = calcN(hp);
+
+  // Base normal for triplanar blending weights
+  vec3 bn = calcBaseN(hp);
+
+  // Triplanar albedo blending
+  vec3 aw = pow(abs(bn), vec3(4.0));
+  aw /= (aw.x + aw.y + aw.z);
+
+  vec3 albXZ = texture(uAlbedo, hp.xz * uTile).rgb;
+  vec3 albZY = texture(uAlbedo, hp.zy * uTile).rgb;
+  vec3 albXY = texture(uAlbedo, hp.xy * uTile).rgb;
+  vec3 alb = albXZ * aw.y + albZY * aw.x + albXY * aw.z;
+  alb = pow(alb, vec3(2.2)); // sRGB to linear
+
+  // Triplanar normal map blending
+  vec3 tnXZ = texture(uNormal, hp.xz * uTile).rgb * 2.0 - 1.0;
+  vec3 tnZY = texture(uNormal, hp.zy * uTile).rgb * 2.0 - 1.0;
+  vec3 tnXY = texture(uNormal, hp.xy * uTile).rgb * 2.0 - 1.0;
+
+  // Reorient each tangent-space normal to world via its face TBN
+  vec3 wnXZ = normalize(vec3(tnXZ.x, tnXZ.z, tnXZ.y)); // Y-face: T=X B=Z N=Y
+  vec3 wnZY = normalize(vec3(tnZY.z, tnZY.y, tnZY.x)); // X-face: T=Z B=Y N=X
+  vec3 wnXY = normalize(vec3(tnXY.x, tnXY.y, tnXY.z)); // Z-face: T=X B=Y N=Z
+  vec3 wn = normalize(wnXZ * aw.y + wnZY * aw.x + wnXY * aw.z);
+
+  // Blend displaced SDF normal with texture normal
+  wn = normalize(dn + wn * 0.5);
+
+   // Sample triplanar AO + roughness (same blending weights)
+  float aoXZ = texture(uAO, hp.xz * uTile).r;
+  float aoZY = texture(uAO, hp.zy * uTile).r;
+  float aoXY = texture(uAO, hp.xy * uTile).r;
+  float texAO = aoXZ * aw.y + aoZY * aw.x + aoXY * aw.z;
+
+  float rXZ = texture(uRoughness, hp.xz * uTile).r;
+  float rZY = texture(uRoughness, hp.zy * uTile).r;
+  float rXY = texture(uRoughness, hp.xy * uTile).r;
+  float roughness = rXZ * aw.y + rZY * aw.x + rXY * aw.z;
+
+  // Lighting
+  vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
+  vec3 lightCol = vec3(0.9, 0.9, 1.0); // warm
+  vec3 viewDir = normalize(uCamPos - hp);
+  float ndl = max(dot(wn, lightDir), 0.0);
+
+  // Specular (GGX-ish)
+  vec3 H = normalize(viewDir + lightDir);
+  float ndh = max(dot(wn, H), 0.0);
+  float r2 = roughness * roughness;
+  float spec = pow(ndh, 2.0 / (r2 + 0.001)) * (1.0 - roughness) * 0.5;
+
+  // Shadows + AO
+  float shadow = sdfShadow(hp + wn * 0.02, lightDir);
+  float ao = sdfAO(hp, dn) * texAO;
+
+  // Combine
+  vec3 col = alb * 0.12 * ao  // ambient
+           + alb * ndl * shadow * lightCol // diffuse
+           + vec3(spec) * shadow * lightCol; // specular
+
+  // col *= ao;
+
+    // After tonemap + gamma
+  col = col / (col + 1.0);
+  col = pow(col, vec3(1.0 / 2.2));
+
+  // Saturation boost
+  float lum = dot(col, vec3(0.299, 0.587, 0.114));
+  col = mix(vec3(lum), col, 1.4); // 1.4 = saturation multiplier
+
+  fc = vec4(col, 1.0);
+}
+
+
+`;
+
+function cs(s,t){const sh=gl.createShader(t);gl.shaderSource(sh,s);gl.compileShader(sh);
+  if(!gl.getShaderParameter(sh,gl.COMPILE_STATUS))dbg('SHADER ERR: '+gl.getShaderInfoLog(sh));
+  return sh;}
+
+const prog=gl.createProgram();
+gl.attachShader(prog,cs(VS,gl.VERTEX_SHADER));
+gl.attachShader(prog,cs(FS,gl.FRAGMENT_SHADER));
+gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog,gl.LINK_STATUS))dbg('LINK ERR: '+gl.getProgramInfoLog(prog));
+else dbg('Linked OK');
+gl.useProgram(prog);
+
+const loc={};
+['uRes','uCamPos','uCamRot','uAlbedo','uHeight','uNormal','uTile','uHScale', 'uHScaleMult', 'uTime','uSpeed'].forEach(n=>{
+  loc[n]=gl.getUniformLocation(prog,n);
+  if(loc[n]===null) dbg('WARN null: '+n);
+});
+if(loc.uAlbedo!==null) gl.uniform1i(loc.uAlbedo,0);
+if(loc.uHeight!==null) gl.uniform1i(loc.uHeight,1);
+if(loc.uNormal!==null) gl.uniform1i(loc.uNormal,2);
+if(loc.uAO!==null) gl.uniform1i(loc.uAO, 3);
+if(loc.uRoughness!==null) gl.uniform1i(loc.uRoughness, 4);
+while(gl.getError());
+
+// Fullscreen tri
+const vao=gl.createVertexArray();
+gl.bindVertexArray(vao);
+const buf=gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+gl.bindVertexArray(null);
+
+// Mouse orbit
+let rotX=-.5,rotY=.4,dist=3.5,drag=false,lx,ly;
+canvas.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;});
+addEventListener('pointerup',()=>drag=false);
+addEventListener('pointermove',e=>{if(!drag)return;rotY+=(e.clientX-lx)*.005;rotX+=(e.clientY-ly)*.005;rotX=Math.max(-1.5,Math.min(1.5,rotX));lx=e.clientX;ly=e.clientY;});
+canvas.addEventListener('wheel',e=>{dist+=e.deltaY*.004;dist=Math.max(0.5,Math.min(12,dist));e.preventDefault();},{passive:false});
+
+const sTile=document.getElementById('sTile'),vTile=document.getElementById('vTile');
+sTile.oninput=()=>vTile.textContent=parseFloat(sTile.value).toFixed(2);
+const sHScale=document.getElementById('sHScale'),vHScale=document.getElementById('vHScale');
+sHScale.oninput=()=>vHScale.textContent=parseFloat(sHScale.value).toFixed(2);
+const sHScaleMult=document.getElementById('sHScaleMult'),vHScaleMult=document.getElementById('vHScaleMult');
+sHScaleMult.oninput=()=>vHScaleMult.textContent=parseFloat(sHScaleMult.value).toFixed(2);
+
+const sSpeed=document.getElementById('sSpeed'),vSpeed=document.getElementById('vSpeed');
+sSpeed.oninput=()=>vSpeed.textContent=parseFloat(sSpeed.value).toFixed(2);
+
+Promise.all([
+  loadTex('./textures/gray_rocks_diff_2k.jpg'),
+  loadTex('./textures/gray_rocks_disp_2k.png'),
+  loadTex('./textures/gray_rocks_nor_gl_2k.jpg'),
+  loadTex('./textures/gray_rocks_ao_2k.jpg'),
+  loadTex('./textures/gray_rocks_rough_2k.jpg'),
+]).then(([tAlb,tHgt,tNrm,tAO,tRough])=>{
+  gl.clearColor(.04,.04,.05,1);
+
+  let fc=0;
+  function frame(t){
+    requestAnimationFrame(frame);
+    resize();t*=.001;fc++;
+
+    const cy=Math.cos(rotX),sy=Math.sin(rotX),cx=Math.cos(rotY),sx=Math.sin(rotY);
+    const eye=[sx*cy*dist,-sy*dist,cx*cy*dist];
+
+    // Look-at (0,0,0)
+    let fw=[-eye[0],-eye[1],-eye[2]];
+    let fl=Math.hypot(...fw);fw[0]/=fl;fw[1]/=fl;fw[2]/=fl;
+    let rt=[fw[2],0,-fw[0]];
+    let rl=Math.hypot(...rt);rt[0]/=rl;rt[1]/=rl;rt[2]/=rl;
+    const cu=[fw[1]*rt[2]-fw[2]*rt[1],fw[2]*rt[0]-fw[0]*rt[2],fw[0]*rt[1]-fw[1]*rt[0]];
+
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(prog);
+    gl.uniform2f(loc.uRes,canvas.width,canvas.height);
+    gl.uniform3fv(loc.uCamPos,eye);
+    gl.uniformMatrix3fv(loc.uCamRot,false,new Float32Array([rt[0],rt[1],rt[2],cu[0],cu[1],cu[2],fw[0],fw[1],fw[2]]));
+    gl.uniform1f(loc.uTile,parseFloat(sTile.value));
+    gl.uniform1f(loc.uHScale,parseFloat(sHScale.value));
+    gl.uniform1f(loc.uHScaleMult,parseFloat(sHScaleMult.value));
+    gl.uniform1f(loc.uTime, t);
+    gl.uniform1f(loc.uSpeed, parseFloat(sSpeed.value));
+
+    gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,tAlb);
+    gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,tHgt);
+    gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,tNrm);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, tAO);
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, tRough);
+
+    gl.bindVertexArray(vao);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+
+    if(fc<=2){
+      const e=gl.getError();
+      if(e)dbg('DRAW ERR frame '+fc+': 0x'+e.toString(16));
+      else if(fc===2) dbg('✓ rendering OK');
+    }
+  }
+  requestAnimationFrame(frame);
+});
+</script>
+</body>
+</html>
