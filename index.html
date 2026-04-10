@@ -110,6 +110,9 @@ float smin(float a, float b, float k){
 
 // Base SDF without displacement
 float scene(vec3 p){
+  // Repeat every 6 units on X and Z
+  p.xz = mod(p.xz + 3.0, 6.0) - 3.0;
+  
   float floor = p.y + 1.5;
   float pillarL = sdBox(p - vec3(-1.2, 0.0, 0.0), vec3(0.3, 1.5, 0.4));
   float pillarR = sdBox(p - vec3( 1.2, 0.0, 0.0), vec3(0.3, 1.5, 0.4));
@@ -217,7 +220,7 @@ float march(vec3 ro, vec3 rd){
   for(int i = 0; i < 256; i++){
     float d = sceneDisplaced(ro + rd * t);
     if(d < 0.001) return t;
-    if(t > 20.0) return -1.0;
+    if(t > 200.0) return -1.0;
     t += d * 0.8; // slight relaxation for displaced SDF
   }
   return -1.0;
